@@ -1,97 +1,153 @@
-"""Résumé du pipeline load_filter 
+"""
+Résumé du pipeline load_filter avec PRs humaines via GitHub API
 
-1-Charger les tables pull_requests, repositories, users depuis HuggingFace
-
-2-Filtrer les repos avec ≥500 stars
-
-3-Sélectionner PR AI + PR humaines correspondantes
-
-4-Joindre les informations sur l’auteur (type, provider)
-
-5-Calculer :
-
-    Durée review (heures)
-
-    Merge (0/1)
-
-    Nombre de commentaires
-
-    Closed-loop flag
-
-6-Sauvegarder les datasets intermédiaires
+1. Charger les tables pull_requests, repositories, users depuis HuggingFace
+2. Filtrer les repos avec ≥500 stars
+3. Sélectionner PR AI + PR humaines correspondantes
+4. Récupérer les PR humaines via GitHub API si absentes
+5. Joindre les informations sur l’auteur (type, login)
+6. Calculer :
+    - Durée review (heures)
+    - Merge (0/1)
+    - Nombre de commentaires
+    - Closed-loop flag
+7. Sauvegarder les datasets intermédiaires
 """
 
-# Import de Pandas et lecture des fichiers .parquet depuis HuggingFace
+import os
 import pandas as pd
+import requests
+from dotenv import load_dotenv
+from datetime import datetime
 
+# -----------------------------
+# Charger le token GitHub depuis .env
+# -----------------------------
+load_dotenv()
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+if not GITHUB_TOKEN:
+    raise ValueError("Le token GitHub n'est pas défini dans le fichier .env !")
+
+HEADERS = {
+    "Authorization": f"token {GITHUB_TOKEN}",
+    "Accept": "application/vnd.github.v3+json"
+}
+
+# -----------------------------
+#  Charger les datasets HuggingFace
+# -----------------------------
 pull_requests = pd.read_parquet("hf://datasets/hao-li/AIDev/all_pull_request.parquet")
 repositories = pd.read_parquet("hf://datasets/hao-li/AIDev/all_repository.parquet")
 users = pd.read_parquet("hf://datasets/hao-li/AIDev/all_user.parquet")
 
-"""
-pull_requests : contient toutes les PRs (humaines + AI)
-repositories : infos sur chaque repo (stars, langage, etc.)
-users : infos sur les auteurs (humains ou agents IA)
-"""
-
-# Filtrage des repositories pour ne garder que ceux avec au moins 500 étoiles
+# -----------------------------
+#  Filtrer les repositories populaires (≥500 stars)
+# -----------------------------
 repositories_filtered = repositories[repositories['stars'] >= 500]
+repos_list = repositories_filtered['full_name'].tolist()  # format owner/repo
 
-""" On ne garde que les repos “populaires” pour garantir la qualité et la généralisation"""
+# -----------------------------
+#  Séparer les PR AI et PR humaines existantes
+# -----------------------------
+pr_ai = pull_requests[pull_requests['agent'] != 'human'].copy()
+pr_human = pull_requests[pull_requests['agent'] == 'human'].copy()
 
-# Garder uniquement les PRs associées aux repositories filtrés
-pr_filtered = pull_requests[pull_requests['repo_id'].isin(repositories_filtered['id'])].copy()
+# -----------------------------
+#  Limiter les PRs humaines à la période des PR AI
+# -----------------------------
+pr_ai['created_at'] = pd.to_datetime(pr_ai['created_at'], utc=True)
+pr_ai['closed_at'] = pd.to_datetime(pr_ai['closed_at'], utc=True)
 
-# Selectionner les pull requests générées par des agents IA + contrôle humain
-# AI PR
-pr_ai = pr_filtered[pr_filtered['is_ai_generated'] == True].copy()
+if not pr_human.empty:
+    pr_human['created_at'] = pd.to_datetime(pr_human['created_at'], utc=True)
+    pr_human['closed_at'] = pd.to_datetime(pr_human['closed_at'], utc=True)
 
-# PR humaines (même repos, même période) pour comparaison
-pr_human = pr_filtered[pr_filtered['is_ai_generated'] == False].copy()
+min_date = pr_ai['created_at'].min().strftime("%Y-%m-%d")
+max_date = pr_ai['created_at'].max().strftime("%Y-%m-%d")
 
-# On peut limiter à la même période que les PR AI pour le contrôle
-min_date = pr_ai['created_at'].min()
-max_date = pr_ai['created_at'].max()
-pr_human = pr_human[(pr_human['created_at'] >= min_date) & (pr_human['created_at'] <= max_date)].copy()
+# -----------------------------
+#  Fonction pour récupérer PR humaines via GitHub API
+# -----------------------------
+def fetch_human_prs(owner_repo, start_date=min_date, end_date=max_date):
+    """
+    Récupère les PR humaines pour un dépôt donné via GitHub API
+    """
+    prs = []
+    page = 1
+    while True:
+        url = f"https://api.github.com/repos/{owner_repo}/pulls"
+        params = {
+            "state": "all",
+            "per_page": 100,
+            "page": page,
+            "sort": "created",
+            "direction": "asc"
+        }
+        response = requests.get(url, headers=HEADERS, params=params)
+        data = response.json()
+        if not data:
+            break
 
-# Joindre les infos sur les utilisateurs
-# Ajouter le type d'auteur (AI agent, humain) et le provider
-pr_ai = pr_ai.merge(users[['id', 'user_type', 'provider']], 
-                    left_on='user_id', right_on='id', how='left')
-pr_human = pr_human.merge(users[['id', 'user_type']], 
-                           left_on='user_id', right_on='id', how='left')
+        for pr in data:
+            created_at = pr.get('created_at')
+            if start_date <= created_at[:10] <= end_date:
+                user_type = pr['user'].get('type', '')
+                login = pr['user'].get('login', '')
+                # Exclure les bots
+                if user_type == "User" and "bot" not in login.lower():
+                    prs.append({
+                        "id": pr['id'],
+                        "repo_full_name": owner_repo,
+                        "user_login": login,
+                        "user_id": pr['user']['id'],
+                        "created_at": pr['created_at'],
+                        "closed_at": pr.get('closed_at', None),
+                        "merged_at": pr.get('merged_at', None),
+                        "num_comments": pr.get('comments', 0),              # KeyError évité
+                        "num_review_comments": pr.get('review_comments', 0),
+                        "num_commits_after_review": 0,                     # Placeholder
+                        "agent": "human"
+                    })
+        page += 1
+    return prs
 
-"""On sait qui a écrit la PR et son type
+# -----------------------------
+#  Compléter pr_human via GitHub API si vide
+# -----------------------------
+if pr_human.empty:
+    all_human_prs = []
+    for repo_full_name in repos_list:
+        human_prs = fetch_human_prs(repo_full_name)
+        all_human_prs.extend(human_prs)
+    pr_human = pd.DataFrame(all_human_prs)
+    pr_human['created_at'] = pd.to_datetime(pr_human['created_at'], utc=True)
+    pr_human['closed_at'] = pd.to_datetime(pr_human['closed_at'], utc=True)
 
-Pour RQ3 (closed-loop), on aura besoin du provider IA"""
+# -----------------------------
+# Joindre les infos utilisateurs
+# -----------------------------
+pr_ai = pr_ai.merge(users[['id', 'login']], left_on='user_id', right_on='id', how='left')
+pr_human = pr_human.merge(users[['id', 'login']], left_on='user_id', right_on='id', how='left')
 
-# Conversion des dates en datetime
-pr_ai['created_at'] = pd.to_datetime(pr_ai['created_at'], errors='coerce')
-pr_ai['closed_at'] = pd.to_datetime(pr_ai['closed_at'], errors='coerce')
+# -----------------------------
+# Calcul des métriques
+# -----------------------------
+for df in [pr_ai, pr_human]:
+    # Durée review (heures)
+    df['review_duration_hours'] = (df['closed_at'] - df['created_at']).dt.total_seconds() / 3600
+    # Merge (0/1)
+    df['merged'] = df['merged_at'].notna().astype(int)
+    # Colonnes de commentaires
+    for col in ['num_comments', 'num_review_comments', 'num_commits_after_review']:
+        if col not in df.columns:
+            df[col] = 0
 
-pr_human['created_at'] = pd.to_datetime(pr_human['created_at'], errors='coerce')
-pr_human['closed_at'] = pd.to_datetime(pr_human['closed_at'], errors='coerce')
+# Closed-loop flag (placeholder)
+pr_ai['closed_loop'] = 0
 
-# Durée de review (RQ1) (différence entre created_at et closed_at en heures)
-pr_ai.loc[:, 'review_duration_hours'] = ((pr_ai['closed_at'] - pr_ai['created_at']).dt.total_seconds() / 3600).fillna(0)
-pr_human.loc[:, 'review_duration_hours'] = ((pr_human['closed_at'] - pr_human['created_at']).dt.total_seconds() / 3600).fillna(0)
-
-# Merge/acceptation (RQ1)
-pr_ai['merged'] = pr_ai['merged'].astype(int)
-pr_human['merged'] = pr_human['merged'].astype(int)
-
-# Nombre de commentaires / commits (RQ2 simplifié)
-# Vérifier si les colonnes existent sinon les créer
-for col in ['num_comments', 'num_review_comments', 'num_commits_after_review']:
-    if col not in pr_ai.columns:
-        pr_ai[col] = 0
-
-# Closed-loop flag (RQ3) - placeholder car review_provider absent
-pr_ai['closed_loop'] = 0  # 1 si l’agent IA et le bot de review viennent du même fournisseur, 0 sinon
-
-"""Permet de mesurer le biais “closed-loop”"""
-
-# Sauvegarder le dataset intermédiaire
+# -----------------------------
+# Sauvegarder les datasets intermédiaires
+# -----------------------------
+os.makedirs("data/intermediate", exist_ok=True)
 pr_ai.to_parquet("data/intermediate/pr_ai_filtered.parquet", index=False)
 pr_human.to_parquet("data/intermediate/pr_human_filtered.parquet", index=False)
-"""Datasets intermédiaires sauvegardés pour analyse ultérieure"""
